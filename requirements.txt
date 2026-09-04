@@ -1,0 +1,10 @@
+# AstrBot 已内置的基础依赖无需重复声明
+# 解析/下载核心（来自 astrbot_plugin_parser 的依赖闭包）
+aiohttp>=3.9,<4
+aiofiles>=23.2,<25
+msgspec>=0.20.0,<1.0.0
+typing_extensions>=4.9
+tqdm>=4.67.1,<5.0.0
+curl_cffi>=0.13.0,<0.15.0
+bilibili-api-python>=17.4.1,<18.0.0
+yt-dlp[default]>=2025.12.8

@@ -1,0 +1,49 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# ---- 虚拟环境 / 依赖 ----
+.venv/
+venv/
+env/
+ENV/
+node_modules/
+
+# ---- 环境变量与密钥（永不提交）----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# ---- 日志 / 会话 ----
+*.log
+logs/
+*.session
+
+# ---- 打包 / 发布产物 ----
+*.zip
+*.tgz
+*.tar.gz
+
+# ---- 登录二维码 / 运行时凭据（正常写入 AstrBot data 目录，此处兜底）----
+login_qrcode.png
+.qqcli/
+cookies/
+*.credential.json
+
+# ---- 编辑器 / 系统文件 ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,8 @@
+name: astrbot_plugin_video_to_channel # 插件唯一识别名，以 astrbot_plugin_ 前缀开头
+display_name: 视频搬运工 # 用于展示的名字
+desc: 监听指定群聊/私聊中的视频分享链接（B站、抖音），自动解析下载并上传到腾讯频道指定版块。
+short_desc: 视频链接自动搬运到腾讯频道
+version: v0.3.0
+author: Seven
+repo: https://github.com/ShuShengSeven/astrbot_plugin_video_to_channel
+astrbot_version: ">=4.9.2"

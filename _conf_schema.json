@@ -1,0 +1,189 @@
+{
+  "session_whitelist": {
+    "description": "允许触发的会话 ID 列表（群聊/私聊）",
+    "hint": "在 AstrBot 中向目标会话发送管理员命令 /v2c sid 可获取当前会话 ID。留空表示不触发任何会话（安全默认）。",
+    "type": "list",
+    "default": []
+  },
+  "debounce_seconds": {
+    "description": "同一链接防抖秒数",
+    "hint": "同一会话内同一链接在窗口期内只处理一次，避免刷屏。0 表示关闭防抖。",
+    "type": "int",
+    "slider": {
+      "min": 0,
+      "max": 600,
+      "step": 10
+    },
+    "default": 120
+  },
+  "target_guild_id": {
+    "description": "目标腾讯频道 ID（guild_id）",
+    "hint": "在私聊中使用 /v2c guilds 查询，然后用 /v2c target <频道ID> <版块ID> 设置。",
+    "type": "string",
+    "default": ""
+  },
+  "target_channel_id": {
+    "description": "目标版块 ID（channel_id）",
+    "hint": "在私聊中使用 /v2c channels <频道ID> 查询，然后用 /v2c target <频道ID> <版块ID> 设置。",
+    "type": "string",
+    "default": ""
+  },
+  "cli_command": {
+    "description": "tencent-channel-cli 来源",
+    "hint": "auto（默认）= 插件自动下载并托管当前平台二进制；也可填写外部命令或绝对路径（如 /usr/local/bin/tencent-channel-cli）。",
+    "type": "string",
+    "default": "auto"
+  },
+  "cli_timeout": {
+    "description": "CLI 上传超时（秒）",
+    "type": "int",
+    "slider": {
+      "min": 60,
+      "max": 1800,
+      "step": 30
+    },
+    "default": 600
+  },
+  "max_concurrent": {
+    "description": "最大并发处理数",
+    "hint": "同时下载/上传的任务数，避免过多并发触发平台限流。",
+    "type": "int",
+    "slider": {
+      "min": 1,
+      "max": 8,
+      "step": 1
+    },
+    "default": 2
+  },
+  "download": {
+    "description": "下载相关配置",
+    "type": "object",
+    "items": {
+      "max_size_mb": {
+        "description": "允许下载的视频最大体积（MB）",
+        "type": "int",
+        "slider": {
+          "min": 10,
+          "max": 500,
+          "step": 10
+        },
+        "default": 90
+      },
+      "max_minutes": {
+        "description": "允许下载的视频最大时长（分钟）",
+        "type": "int",
+        "slider": {
+          "min": 1,
+          "max": 60,
+          "step": 1
+        },
+        "default": 15
+      },
+      "download_timeout": {
+        "description": "下载请求超时（秒）",
+        "type": "int",
+        "slider": {
+          "min": 30,
+          "max": 600,
+          "step": 10
+        },
+        "default": 280
+      },
+      "download_retry_times": {
+        "description": "下载失败重试次数",
+        "type": "int",
+        "slider": {
+          "min": 0,
+          "max": 5,
+          "step": 1
+        },
+        "default": 2
+      },
+      "common_timeout": {
+        "description": "普通请求超时（秒）",
+        "type": "int",
+        "slider": {
+          "min": 5,
+          "max": 60,
+          "step": 1
+        },
+        "default": 15
+      },
+      "proxy": {
+        "description": "代理地址",
+        "hint": "如 http://127.0.0.1:7890，留空为直连。",
+        "type": "string",
+        "default": ""
+      }
+    }
+  },
+  "parsers": {
+    "description": "各平台解析器开关与凭据",
+    "type": "object",
+    "items": {
+      "bilibili": {
+        "description": "B站解析器",
+        "type": "object",
+        "items": {
+          "enable": {
+            "description": "启用 B站解析",
+            "type": "bool",
+            "default": true
+          },
+          "cookies": {
+            "description": "B站 Cookie（可选）",
+            "hint": "填写后可下载更高清晰度/登录可见内容。格式 SESSDATA=xxx; bili_jct=xxx; DedeUserID=xxx",
+            "type": "string",
+            "secret": true,
+            "default": ""
+          },
+          "video_quality": {
+            "description": "B站下载清晰度",
+            "type": "string",
+            "options": [
+              "_360P",
+              "_480P",
+              "_720P",
+              "_1080P",
+              "_4K"
+            ],
+            "labels": [
+              "360P",
+              "480P",
+              "720P",
+              "1080P",
+              "4K"
+            ],
+            "default": "_720P"
+          },
+          "video_codec_list": {
+            "description": "B站视频编码（可多选）",
+            "hint": "可选 AVC / HEVC / AV1，留空默认 AVC。",
+            "type": "list",
+            "default": [
+              "AVC"
+            ]
+          }
+        }
+      },
+      "douyin": {
+        "description": "抖音解析器",
+        "type": "object",
+        "items": {
+          "enable": {
+            "description": "启用抖音解析",
+            "type": "bool",
+            "default": true
+          },
+          "cookies": {
+            "description": "抖音 Cookie（可选）",
+            "hint": "匿名状态通常也能解析，遇到风控时填写 Cookie。",
+            "type": "string",
+            "secret": true,
+            "default": ""
+          }
+        }
+      }
+    }
+  }
+}
