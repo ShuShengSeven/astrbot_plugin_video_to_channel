@@ -183,6 +183,24 @@
             "default": ""
           }
         }
+      },
+      "kuaishou": {
+        "description": "快手解析器",
+        "type": "object",
+        "items": {
+          "enable": {
+            "description": "启用快手解析",
+            "type": "bool",
+            "default": true
+          },
+          "cookies": {
+            "description": "快手 Cookie（可选）",
+            "hint": "匿名状态通常也能解析，遇到风控时填写 Cookie。",
+            "type": "string",
+            "secret": true,
+            "default": ""
+          }
+        }
       }
     }
   }

@@ -8,5 +8,6 @@
 from .base import BaseParser
 from .bilibili import BilibiliParser
 from .douyin import DouyinParser
+from .kuaishou import KuaiShouParser
 
-__all__ = ["BaseParser", "BilibiliParser", "DouyinParser"]
+__all__ = ["BaseParser", "BilibiliParser", "DouyinParser", "KuaiShouParser"]

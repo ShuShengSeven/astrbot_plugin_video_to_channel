@@ -356,6 +356,17 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(cfg.cli_managed)
         self.assertEqual(cfg.cli_command, "auto")
 
+    def test_kuaishou_registered_in_config(self):
+        from astrbot_plugin_video_to_channel.core.config import (
+            SUPPORTED_PLATFORMS,
+            _PARSER_DEFAULTS,
+        )
+
+        self.assertIn("kuaishou", SUPPORTED_PLATFORMS)
+        self.assertIn("kuaishou", _PARSER_DEFAULTS)
+        self.assertIs(_PARSER_DEFAULTS["kuaishou"]["enable"], True)
+        self.assertEqual(_PARSER_DEFAULTS["kuaishou"]["cookies"], "")
+
     def test_update_target_persists(self):
         class FakeAstrBotConfig(dict):
             def __init__(self, *a, **k):

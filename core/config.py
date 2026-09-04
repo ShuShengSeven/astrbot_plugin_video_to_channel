@@ -13,7 +13,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 # 本插件目前支持的解析器平台；新增平台时在此登记
-SUPPORTED_PLATFORMS: tuple[str, ...] = ("bilibili", "douyin")
+SUPPORTED_PLATFORMS: tuple[str, ...] = ("bilibili", "douyin", "kuaishou")
 
 # 每个平台的默认配置，避免解析器访问缺省字段时抛异常
 _PARSER_DEFAULTS: dict[str, dict[str, Any]] = {
@@ -25,6 +25,11 @@ _PARSER_DEFAULTS: dict[str, dict[str, Any]] = {
         "video_codec_list": ["AVC"],
     },
     "douyin": {
+        "enable": True,
+        "use_proxy": False,
+        "cookies": "",
+    },
+    "kuaishou": {
         "enable": True,
         "use_proxy": False,
         "cookies": "",

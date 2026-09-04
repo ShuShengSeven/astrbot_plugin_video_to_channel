@@ -11,10 +11,10 @@ from astrbot.api import logger
 
 from ..core.config import PluginConfig
 from ..core.download import Downloader
-from ..core.parsers import BaseParser, BilibiliParser, DouyinParser
+from ..core.parsers import BaseParser, BilibiliParser, DouyinParser, KuaiShouParser
 
 # 参与注册的解析器类；未来新增平台在此追加即可
-_PARSER_CLASSES: tuple[type[BaseParser], ...] = (BilibiliParser, DouyinParser)
+_PARSER_CLASSES: tuple[type[BaseParser], ...] = (BilibiliParser, DouyinParser, KuaiShouParser)
 
 
 class ParserRouter:

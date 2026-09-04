@@ -1,6 +1,6 @@
 # astrbot_plugin_video_to_channel
 
-监听指定群聊/私聊中的视频平台分享链接（v1：B站、抖音），收到后自动：
+监听指定群聊/私聊中的视频平台分享链接（v1：B站、抖音、快手），收到后自动：
 1. 解析链接并获取视频标题；
 2. 下载视频到本地（带大小/时长限制）；
 3. 通过 `tencent-channel-cli` 上传到**指定腾讯频道的指定版块**；
@@ -30,6 +30,7 @@ main.py (Star 消息入口 + /v2c 指令组)
 core/  (移植自 astrbot_plugin_parser)
    ├── parsers/bilibili/   B站解析器
    ├── parsers/douyin/     抖音解析器
+   ├── parsers/kuaishou.py 快手解析器（仅视频）
    ├── download.py         流式下载（限大小/时长/重试）
    └── data.py             ParseResult/VideoContent 统一数据结构
 ```
@@ -64,6 +65,7 @@ core/  (移植自 astrbot_plugin_parser)
 | `download.*` | 大小/时长/超时/重试/代理 |
 | `parsers.bilibili` | B站开关、Cookie、清晰度、编码 |
 | `parsers.douyin` | 抖音开关、Cookie（可选） |
+| `parsers.kuaishou` | 快手开关、Cookie（可选） |
 
 ## 私聊管理指令（ADMIN + 私聊）
 
@@ -98,13 +100,14 @@ core/  (移植自 astrbot_plugin_parser)
 
 - B站：`https://b23.tv/xxx`、`BV1xxxx`、`av123456`、完整视频页等
 - 抖音：分享口令中的 `https://v.douyin.com/xxx`、`https://www.douyin.com/video/<id>` 等
+- 快手：`https://v.kuaishou.com/xxx` 短链、`https://www.kuaishou.com/short-video/<id>`、`https://v.m.chenzhongtech.com/fw/...` 等
 
 插件会回执“开始解析…”，完成后回执上传结果（含分享链接）。
 
 ## 行为说明与限制
 
 - 上传帖子内容默认使用解析出的视频标题作为正文；单条视频时按腾讯频道规则不强制长帖标题，CLI 会根据视频参数自动处理。
-- 图文、音频、多视频等解析结果 v1 不搬运（会明确提示），后续可扩展。
+- 图文、音频、多视频等解析结果 v1 不搬运（会明确提示），后续可扩展；其中快手图文/图集会直接提示“暂不支持，仅搬运视频”。
 - 同一链接在防抖窗口内重复发送会被静默跳过。
 - 上传成功后会清理本地临时文件（位于 AstrBot `data/plugin_data/astrbot_plugin_video_to_channel/cache/`）；托管 CLI 位于同目录 `bin/`。
 
