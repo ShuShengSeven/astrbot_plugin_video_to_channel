@@ -24,63 +24,101 @@ class ParserRouter:
         self.cfg = cfg
         self.downloader = downloader
         self.parser_map: dict[str, BaseParser] = {}
-        self.patterns: list[tuple[str, re.Pattern[str]]] = []
+        # (关键词, 已编译正则, 解析器实例)：解析器随表项一起保存，
+        # 避免两个平台使用同名关键词时 parser_map 被互相覆盖。
+        self.patterns: list[tuple[str, re.Pattern[str], BaseParser]] = []
 
-    def initialize(self) -> None:
-        """按配置启用平台并构建匹配表（插件加载/重载时调用）。"""
-        self.parser_map.clear()
-        self.patterns.clear()
+    async def initialize(self) -> None:
+        """按配置重建匹配表（插件加载/热重载时调用）。
 
+        两条硬要求：
+        1. 先建后换：绝不在构建前清空正在工作的表。旧实现先 clear()，
+           任何一个平台构造失败都会让 patterns 永久为空 —— 整个插件对所有消息哑火。
+        2. 单平台故障隔离：某个平台解析器构造失败只跳过该平台，其余照常可用。
+        """
         enabled = set(self.cfg.parser.enabled_platforms())
+        new_map: dict[str, BaseParser] = {}
+        new_patterns: list[tuple[str, re.Pattern[str], BaseParser]] = []
+        ready: list[str] = []
+        failed: list[str] = []
+
         for cls in _PARSER_CLASSES:
             platform_name = cls.platform.name
             if platform_name not in enabled:
                 logger.debug(f"[parser] 平台未启用: {platform_name}")
                 continue
-            parser = cls(self.cfg, self.downloader)
-            for keyword, _ in cls._key_patterns:  # type: ignore[attr-defined]
-                self.parser_map[keyword] = parser
+            try:
+                parser = cls(self.cfg, self.downloader)
+                entries = [
+                    (
+                        keyword,
+                        re.compile(pat) if isinstance(pat, str) else pat,
+                        parser,
+                    )
+                    for keyword, pat in cls._key_patterns  # type: ignore[attr-defined]
+                    if keyword not in cls.non_portable_keywords
+                ]
+            except Exception as e:  # noqa: BLE001
+                failed.append(cls.platform.display_name)
+                logger.exception(f"[parser] 平台初始化失败，已跳过该平台: {platform_name}")
+                continue
+
+            skipped = len(cls._key_patterns) - len(entries)  # type: ignore[attr-defined]
+            if skipped:
+                logger.debug(
+                    f"[parser] {cls.platform.display_name} 跳过 {skipped} 个不可搬运的入口"
+                )
+            for keyword, _pat, owner in entries:
+                new_map[keyword] = owner
+            new_patterns.extend(entries)
+            ready.append(cls.platform.display_name)
             logger.info(f"[parser] 已启用平台: {cls.platform.display_name}")
 
-        patterns: list[tuple[str, re.Pattern[str]]] = []
-        for cls in _PARSER_CLASSES:
-            if cls.platform.name not in enabled:
-                continue
-            for keyword, pat in cls._key_patterns:  # type: ignore[attr-defined]
-                patterns.append(
-                    (keyword, re.compile(pat) if isinstance(pat, str) else pat)
-                )
-
         # 长关键词优先匹配，避免短关键词抢占
-        patterns.sort(key=lambda item: -len(item[0]))
-        self.patterns = patterns
+        new_patterns.sort(key=lambda item: -len(item[0]))
 
-        enabled_names = "、".join(
-            cls.platform.display_name for cls in _PARSER_CLASSES
-            if cls.platform.name in enabled
-        )
-        logger.info(f"[parser] 解析器就绪: {enabled_names or '无'}")
+        old_parsers = list(self.parser_map.values())
+        self.parser_map, self.patterns = new_map, new_patterns
+
+        if failed:
+            logger.error(
+                f"[parser] 以下平台初始化失败（其余平台不受影响）：{'、'.join(failed)}"
+            )
+        if not new_patterns:
+            logger.error(
+                "[parser] 没有任何可用的解析入口：白名单会话里的链接将不会被搬运，"
+                "请检查平台开关与插件依赖"
+            )
+        else:
+            logger.info(f"[parser] 解析器就绪: {'、'.join(ready) or '无'}")
+
+        # 换表之后再关旧会话，避免构建失败时把可用实例也关掉
+        await self._close_parsers(old_parsers)
 
     def match(self, text: str) -> tuple[BaseParser, str, re.Match[str]] | None:
         """在文本中寻找第一个受支持的视频链接。"""
         if not text:
             return None
-        for keyword, pattern in self.patterns:
+        for keyword, pattern, parser in self.patterns:
             if keyword not in text:
                 continue
             searched = pattern.search(text)
             if searched is None:
                 continue
-            return self.parser_map[keyword], keyword, searched
+            return parser, keyword, searched
         return None
 
     async def close(self) -> None:
         """关闭所有解析器持有的网络会话。"""
-        unique_parsers = set(self.parser_map.values())
-        for parser in unique_parsers:
+        parsers = list(self.parser_map.values())
+        self.parser_map.clear()
+        self.patterns.clear()
+        await self._close_parsers(parsers)
+
+    @staticmethod
+    async def _close_parsers(parsers) -> None:
+        for parser in dict.fromkeys(parsers):  # 去重且保持顺序
             try:
                 await parser.close_session()
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"[parser] 关闭会话失败: {e}")
-        self.parser_map.clear()
-        self.patterns.clear()

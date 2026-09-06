@@ -1,3 +1,7 @@
+import asyncio
+import os
+import uuid
+
 from asyncio import Task, TimeoutError, create_task, gather, sleep, to_thread
 from collections.abc import Callable, Coroutine
 from functools import wraps
@@ -21,7 +25,7 @@ from .exception import (
     SizeLimitException,
     ZeroSizeException,
 )
-from .utils import LimitedSizeDict, generate_file_name, merge_av, safe_unlink
+from .utils import LimitedSizeDict, generate_file_name, merge_av, safe_rmtree, safe_unlink
 
 P = ParamSpec("P")
 T = TypeVar("T")
@@ -75,6 +79,26 @@ class Downloader:
         self.client = ClientSession(
             timeout=ClientTimeout(total=self.cfg.download_timeout)
         )
+        # 每个目标文件一个下载锁（含引用计数），防止并发下载同一路径互相覆盖
+        self._file_locks: dict[str, tuple[asyncio.Lock, int]] = {}
+
+    def _acquire_file_lock(self, key: str) -> asyncio.Lock:
+        lock, count = self._file_locks.get(key, (None, 0))
+        if lock is None:
+            lock = asyncio.Lock()
+        self._file_locks[key] = (lock, count + 1)
+        return lock
+
+    def _release_file_lock(self, key: str) -> None:
+        entry = self._file_locks.get(key)
+        if entry is None:
+            return
+        lock, count = entry
+        count -= 1
+        if count <= 0:
+            self._file_locks.pop(key, None)
+        else:
+            self._file_locks[key] = (lock, count)
 
     async def close(self):
         """关闭网络客户端"""
@@ -89,15 +113,37 @@ class Downloader:
         headers: dict[str, str] | None = None,
         proxy: str | None | object = ...,
     ) -> Path:
-        """流式下载"""
+        """流式下载（同目标文件串行 + 临时文件原子落盘）。"""
         if not file_name:
             file_name = generate_file_name(url)
         file_path = self.cfg.cache_dir / file_name
-        # 如果文件存在，则直接返回
+        key = str(file_path)
+        lock = self._acquire_file_lock(key)
+        try:
+            async with lock:
+                return await self._streamd_to_file(
+                    url=url, file_path=file_path, headers=headers, proxy=proxy
+                )
+        finally:
+            self._release_file_lock(key)
+
+    async def _streamd_to_file(
+        self,
+        *,
+        url: str,
+        file_path: Path,
+        headers: dict[str, str] | None,
+        proxy: str | None | object,
+    ) -> Path:
+        """真正的流式下载实现：先写 .part，成功后原子替换为最终文件。"""
+        # 如果文件已完整存在，则直接返回
         if file_path.exists():
             return file_path
+
+        part_path = file_path.with_name(file_path.name + ".part")
         headers = headers or self.default_headers
         retries = self.cfg.download_retry_times
+        file_name = file_path.name
         for attempt in range(retries + 1):
             try:
                 async with self.client.get(
@@ -119,7 +165,7 @@ class Downloader:
 
                     downloaded = 0
                     with self.get_progress_bar(file_name, content_length) as bar:
-                        async with aiofiles.open(file_path, "wb") as file:
+                        async with aiofiles.open(part_path, "wb") as file:
                             async for chunk in response.content.iter_chunked(
                                 1024 * 1024
                             ):
@@ -137,17 +183,26 @@ class Downloader:
                             f"HTTP payload incomplete {downloaded}/{content_length}"
                         )
 
+                try:
+                    # 原子替换，避免半截文件被后续任务当作完整视频复用
+                    await asyncio.to_thread(part_path.replace, file_path)
+                except Exception as exc:
+                    await safe_unlink(part_path)
+                    raise DownloadException("媒体文件写入失败") from exc
                 return file_path
             except (ZeroSizeException, SizeLimitException):
-                await safe_unlink(file_path)
+                await safe_unlink(part_path)
                 raise
             except (ClientError, TimeoutError) as exc:
-                await safe_unlink(file_path)
+                await safe_unlink(part_path)
                 if attempt < retries:
                     await sleep(1 + attempt)
                     continue
                 logger.exception(f"下载失败 | url: {url}, file_path: {file_path}")
                 raise DownloadException("媒体下载失败") from exc
+            except asyncio.CancelledError:
+                await safe_unlink(part_path)
+                raise
         raise DownloadException("媒体下载失败")
 
     @staticmethod
@@ -252,15 +307,43 @@ class Downloader:
         headers: dict[str, str] | None = None,
         proxy: str | None = None,
     ) -> Path:
+        """下载音视频并合流到 output_path。
+
+        并发安全（RT-01）：同一 BVID/page 的不同链接形态会并发到达，且 output_path
+        只由 bvid+page 决定。若每个任务把中间文件（v/a 分片、ffmpeg 临时文件）都写到
+        公共 cache 目录的固定文件名，会出现“一个任务 replace/删除另一个任务正在读的
+        文件”的竞态。因此：
+        - 每个任务一个唯一工作目录，v/a 分片与 ffmpeg 临时文件都在目录内；
+        - 最终产物以原子方式落回 output_path；
+        - 工作目录在 finally 里整体清理。
         """
-        download video and audio file by url with stream and merge
-        """
-        v_path, a_path = await gather(
-            self.download_video(v_url, headers=headers, proxy=proxy),
-            self.download_audio(a_url, headers=headers, proxy=proxy),
-        )
-        await merge_av(v_path=v_path, a_path=a_path, output_path=output_path)
-        return output_path
+        stem = output_path.stem
+        workdir_name = f"{stem}-{uuid.uuid4().hex[:8]}"
+        workdir = self.cfg.cache_dir / workdir_name
+        workdir.mkdir(parents=True, exist_ok=True)
+        final_tmp = workdir / output_path.name
+        try:
+            # streamd 会把文件写到 cache_dir / file_name；传子目录相对路径即可
+            # 落进唯一工作目录（父目录已创建），避免多个并发任务共用同名中间文件。
+            v_path, a_path = await gather(
+                self.download_video(
+                    v_url, video_name=f"{workdir_name}/video.m4s",
+                    headers=headers, proxy=proxy,
+                ),
+                self.download_audio(
+                    a_url, audio_name=f"{workdir_name}/audio.m4s",
+                    headers=headers, proxy=proxy,
+                ),
+            )
+            # merge_av 的 ffmpeg 临时文件也随 final_tmp 在目录内
+            await merge_av(v_path=v_path, a_path=a_path, output_path=final_tmp)
+            # 原子落到公共产物名
+            os.replace(final_tmp, output_path)
+            return output_path
+        except asyncio.CancelledError:
+            raise
+        finally:
+            await safe_rmtree(workdir)
 
     async def ytdlp_extract_info(
         self,

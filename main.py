@@ -15,13 +15,20 @@ import time
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star
+from astrbot.core.message.components import Json
 
 from .core.config import PluginConfig
+from .core.utils import extract_json_url, safe_rmtree, safe_unlink
 from .core.download import Downloader
-from .service.channel_uploader import ChannelUploader
-from .service.cli_account import CliAccount, QrLoginInfo
+from .service.channel_uploader import ChannelUploader, PublishResultUnknownError
+from .service.cli_account import CliAccount, QrLoginInfo, is_qr_expired_text
 from .service.cli_binary import CliBinaryManager
-from .service.cli_runner import AlreadyLoggedInError, CliError, CliRunner
+from .service.cli_runner import (
+    AlreadyLoggedInError,
+    CliError,
+    CliRunner,
+    CliTimeoutError,
+)
 from .service.parser_router import ParserRouter
 from .service.pipeline import VideoPipeline
 
@@ -53,21 +60,81 @@ class VideoToChannelPlugin(Star):
 
         # 每个会话进行中的登录轮询任务
         self._login_tasks: dict[str, asyncio.Task] = {}
+        # 正在执行的视频搬运后台任务（持有引用，防止被 GC 且便于卸载时取消）
+        self._bg_tasks: set[asyncio.Task] = set()
+        # 后台任务 -> 正在处理的链接（terminate 标记 UNKNOWN 用）
+        self._task_links: dict[asyncio.Task, str] = {}
 
     async def initialize(self):
         """插件加载/重载时初始化解析器。"""
-        self.router.initialize()
+        await self._cleanup_stale_cache()
+        # 新表构建成功后才关闭旧解析器会话（见 ParserRouter.initialize）。
+        # 旧写法是 close() 在前：构建一旦抛错，匹配表就永久为空，
+        # 表现为“插件已加载但任何链接都不再触发”。
+        await self.router.initialize()
         missing = self.uploader.describe_missing()
         if missing:
             logger.warning("[v2c] 上传配置不完整: " + "；".join(missing))
 
     async def terminate(self):
         """插件卸载/停用时释放资源。"""
-        for task in self._login_tasks.values():
+        # RT-03：任何正在执行的搬运任务此刻都可能在投稿阶段（结果未知）。
+        # 先把它们处理的链接标记为跨实例 UNKNOWN（持久化冷却），再取消任务；
+        # 否则 reload 后新实例会立刻接受同一链接，可能重复投稿。
+        for link in self._task_links.values():
+            try:
+                self.pipeline.mark_link_unknown(link)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[v2c] 标记 UNKNOWN 失败 {link}: {e}")
+        tasks = list(self._bg_tasks) + list(self._login_tasks.values())
+        for task in tasks:
             task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._bg_tasks.clear()
+        self._task_links.clear()
         self._login_tasks.clear()
         await self.router.close()
         await self.downloader.close()
+
+    async def _cleanup_stale_cache(self) -> None:
+        """启动时清理下载残留（无副作用策略）。
+
+        - `.part` 一定是未完成的临时文件，可安全删除；
+        - 超过 24h 的最终文件只可能是历史遗留（正常流程上传后即清理），可安全删除；
+        - 近期文件可能仍被进行中的任务使用，不删除。
+        """
+        cache = self.cfg.cache_dir
+        if not cache.exists():
+            return
+        try:
+            entries = list(cache.iterdir())
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[v2c] 扫描缓存目录失败，跳过启动清理: {e}")
+            return
+        now = time.time()
+        removed = 0
+        for path in entries:
+            try:
+                stale = False
+                if path.is_dir():
+                    # RT-01 任务级工作目录（<stem>-<8hex>）崩溃后残留；
+                    # 只清 mtime 超 24h 的目录，避免误删进行中任务
+                    stale = now - path.stat().st_mtime > 24 * 3600
+                    if stale:
+                        await safe_rmtree(path)
+                        removed += 1
+                    continue
+                stale = path.name.endswith(".part")
+                if not stale:
+                    stale = now - path.stat().st_mtime > 24 * 3600
+                if stale:
+                    await safe_unlink(path)
+                    removed += 1
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"[v2c] 启动清理跳过 {path.name}: {e}")
+        if removed:
+            logger.info(f"[v2c] 启动时清理缓存残留 {removed} 个文件")
 
     # ==================================================================
     # 消息入口：白名单会话内直接发链接即触发
@@ -82,38 +149,97 @@ class VideoToChannelPlugin(Star):
             return
 
         text = (event.message_str or "").strip()
+        # QQ/频道分享常以 JSON 卡片形式发送，纯文本可能不含 URL
         if not text:
-            return
+            text = self._extract_card_url(event) or ""
+            if not text:
+                return
         # 不处理指令文本，避免把 /v2c 等命令内容也当作链接
         if text.startswith("/"):
             return
 
         # 不处理机器人自己发出的消息（某些平台会回推）
-        try:
-            if str(event.get_sender_id()) == str(event.get_self_id()):
-                return
-        except Exception:  # noqa: BLE001
-            pass
-
-        if not self.router.patterns or not self.pipeline.has_supported_link(text):
+        if self._is_self_message(event):
             return
 
-        asyncio.create_task(self._background_handle(umo, text))
-        yield event.plain_result("⏳ 检测到视频分享链接，开始解析并上传到腾讯频道…")
+        if not self.router.patterns or not self.pipeline.has_supported_link(text):
+            card_url = self._extract_card_url(event)
+            if not card_url:
+                return
+            text = card_url
+
+        task = asyncio.create_task(self._background_handle(umo, text))
+        self._bg_tasks.add(task)
+        # 记录这个后台任务正在处理的链接（统一 canonical key），供 terminate 在
+        # 取消时标记 UNKNOWN（RT-03）。必须用 pipeline.canonical_link 而不是原始
+        # 消息文本，否则 terminate 写入的 key 与 process 查询的 key 不一致，
+        # 新实例会放行同一链接导致重复投稿。
+        canonical = self.pipeline.canonical_link(text) or text
+        self._task_links[task] = canonical
+
+        def _done(_task: asyncio.Task) -> None:
+            self._bg_tasks.discard(_task)
+            self._task_links.pop(_task, None)
+
+        task.add_done_callback(_done)
+        # “开始解析”的回执改由流水线在真正开工时发出（见 _background_handle）：
+        # 被去重/防抖跳过的请求此前也会先收到这句承诺，然后就再无下文。
+
+    @staticmethod
+    def _is_self_message(event: AstrMessageEvent) -> bool:
+        """识别机器人自己回推的消息。
+
+        不能直接比较 str(sender) == str(self)：两个取值都为 None 时
+        （部分平台适配器未回填）会得到 "None" == "None" → 判定为“自己发的”，
+        于是该平台上所有链接都被丢弃，插件整体静默失效。
+        """
+        try:
+            sender_id = event.get_sender_id()
+            self_id = event.get_self_id()
+        except Exception:  # noqa: BLE001
+            # 某些平台未实现 get_self_id()，此时不做自消息过滤
+            return False
+        if sender_id is None or self_id is None:
+            return False
+        return str(sender_id) == str(self_id)
+
+    def _extract_card_url(self, event: AstrMessageEvent) -> str | None:
+        """从 JSON 分享卡片中提取第一个受支持的链接。"""
+        try:
+            chain = event.get_messages() or []
+        except Exception:  # noqa: BLE001
+            return None
+        for seg in chain:
+            if not isinstance(seg, Json):
+                continue
+            url = extract_json_url(getattr(seg, "data", None))
+            if url and self.pipeline.has_supported_link(url):
+                return url
+        return None
 
     async def _background_handle(self, umo: str, text: str):
-        """后台任务：完整搬运并回执结果。"""
+        """后台任务：真正开工时回执“开始解析”，完成后回执结果。"""
+
+        async def _accepted() -> None:
+            await self._send(umo, "⏳ 检测到视频分享链接，开始解析并上传到腾讯频道…")
+
         try:
-            result = await self.pipeline.process(umo, text)
+            result = await self.pipeline.process(text, on_accepted=_accepted)
             if result is None:
+                # 去重/防抖/UNKNOWN 冷却跳过：按设计保持静默
                 return
             share_url = result.publish.share_url
             msg = f"✅ 已上传《{result.title}》（{result.platform_name}）到腾讯频道指定版块"
             if share_url:
                 msg += f"\n分享链接: {share_url}"
             await self._send(umo, msg)
+        except asyncio.CancelledError:
+            # RT-03：任务在投稿阶段被 terminate/reload 取消 => 结果未知。
+            # 调用方（terminate）已负责把进行中链接标记为 UNKNOWN，这里直接重抛。
+            raise
         except Exception as e:  # noqa: BLE001
-            logger.exception("[v2c] 视频搬运失败")
+            # 并发搬运时没有上下文的日志无法定位是哪一条
+            logger.exception(f"[v2c] 视频搬运失败 | session={umo} | 内容={text[:120]}")
             await self._send(umo, f"❌ 视频搬运失败：{self._friendly_error(e)}")
 
     # ==================================================================
@@ -293,8 +419,13 @@ class VideoToChannelPlugin(Star):
     @filter.event_message_type(PRIVATE_ONLY, priority=100)
     async def v2c_logout(self, event: AstrMessageEvent):
         """清除本地 CLI 登录凭证。"""
+        umo = event.unified_msg_origin
         try:
             yield event.plain_result("⏳ 正在清除登录凭证…")
+            # 登出后旧二维码轮询已无意义，取消避免稍后误报“登录成功”
+            old = self._login_tasks.get(umo)
+            if old and not old.done():
+                old.cancel()
             message = await self.account.logout()
             yield event.plain_result(f"✅ {message}")
         except Exception as e:  # noqa: BLE001
@@ -350,9 +481,23 @@ class VideoToChannelPlugin(Star):
         """自动轮询 login poll-token，直到登录成功/超时/二维码失效。"""
         deadline = time.monotonic() + max(30, qr.expires_in_s)
         last_message = ""
-        while time.monotonic() < deadline:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             try:
-                result = await self.account.poll_login()
+                # 单次轮询必须自己带上限：poll-token 可能是长轮询，
+                # 沿用 cli_timeout（默认 600s）会让一次轮询就跨过二维码有效期，
+                # 上面的 deadline 和 qr.interval 全部形同虚设。
+                result = await self.account.poll_login(
+                    timeout=max(10, min(int(remaining) + 5, self.cfg.cli_timeout))
+                )
+                if result.expired:
+                    await self._send(
+                        umo,
+                        f"❌ 登录二维码已失效：{result.message}\n请重新发送 /v2c login",
+                    )
+                    return
                 if result.authorized:
                     text = "✅ 登录成功！"
                     if result.message and result.message != "authorized":
@@ -360,9 +505,12 @@ class VideoToChannelPlugin(Star):
                     await self._send(umo, text)
                     return
                 last_message = result.message or last_message
+            except CliTimeoutError as e:
+                # 只是这一轮没问出结果，登录流程仍然有效：继续下一轮
+                logger.debug(f"[v2c] 轮询登录状态超时（继续）: {e}")
             except CliError as e:
                 last_message = str(e)
-                if "过期" in last_message or "已被领取" in last_message:
+                if is_qr_expired_text(last_message):
                     await self._send(
                         umo, f"❌ 登录二维码已失效：{last_message}\n请重新发送 /v2c login"
                     )
@@ -370,7 +518,8 @@ class VideoToChannelPlugin(Star):
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"[v2c] 轮询登录状态异常（继续）: {e}")
                 last_message = str(e)
-            await asyncio.sleep(qr.interval)
+            # RT-04：sleep 受剩余有效期约束，避免 interval 过大导致几乎不轮询
+            await asyncio.sleep(min(qr.interval, max(0.0, remaining)))
 
         tail = f"\n{last_message}" if last_message else ""
         await self._send(umo, f"⏰ 登录超时，未检测到扫码完成{tail}\n请重新发送 /v2c login")
@@ -384,6 +533,17 @@ class VideoToChannelPlugin(Star):
             return (
                 "当前已登录腾讯频道 CLI。如需重新登录：先 /v2c logout，"
                 "或直接 /v2c relogin。"
+            )
+        # D5：超时/结果无法核对 != 失败。误导用户重发 = 重复投稿。
+        if isinstance(e, CliTimeoutError):
+            return (
+                "上传超时，结果未知：帖子可能已经发布成功。"
+                "请先去目标频道确认，确认前不要重发同一链接，以免重复发帖。"
+            )
+        if isinstance(e, PublishResultUnknownError):
+            return (
+                "CLI 已结束但没有返回可核对的结果，无法确认是否发布成功。"
+                "请先去目标频道确认，确认前不要重发同一链接。"
             )
         text = str(e)
         if "8011" in text or "未登录" in text or "not logged" in text.lower():

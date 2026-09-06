@@ -9,6 +9,7 @@ import asyncio
 import io
 import os
 import platform
+import shutil
 import sys
 import tarfile
 from dataclasses import dataclass
@@ -78,10 +79,22 @@ class CliBinaryManager:
     def resolve_existing(self) -> str | None:
         """返回当前可用的二进制路径；找不到时返回 None。"""
         if not self.cfg.cli_managed:
-            candidate = Path(self.cfg.cli_command)
-            return str(candidate) if candidate.is_file() else None
+            return self._resolve_external()
         path = self.managed_bin_path
         return str(path) if path.is_file() else None
+
+    def _resolve_external(self) -> str | None:
+        """解析外部 CLI：既支持绝对/相对路径，也支持只填命令名（走 PATH）。
+
+        配置说明写的是“外部命令/绝对路径”，只判断 is_file() 会让
+        ``cli_command = tencent-channel-cli``（命令已在 PATH 中）这种合法配置
+        被误判为“不存在”，从而整个上传功能不可用。
+        """
+        cmd = self.cfg.cli_command
+        candidate = Path(cmd)
+        if candidate.is_file():
+            return str(candidate)
+        return shutil.which(cmd)
 
     async def ensure(self, force: bool = False) -> str:
         """确保二进制可用并返回路径；managed 模式下缺失时自动下载。"""
@@ -119,12 +132,24 @@ class CliBinaryManager:
                     )
                 doc = await resp.json()
 
-        latest = str((doc.get("dist-tags") or {}).get("latest") or "")
-        version_meta = (doc.get("versions") or {}).get(latest) or {}
-        if not latest or not version_meta:
-            raise RuntimeError("无法从 npm registry 获取 tencent-channel-cli 最新版本")
+        # registry 在包不存在/被限流时可能返回 200 + {"error": "not found"}
+        if not isinstance(doc, dict):
+            raise RuntimeError("npm registry 返回了非预期的数据结构，无法解析最新版本")
+        dist_tags = doc.get("dist-tags")
+        latest = str(dist_tags.get("latest") or "") if isinstance(dist_tags, dict) else ""
+        versions = doc.get("versions")
+        version_meta = (
+            versions.get(latest) if isinstance(versions, dict) and latest else None
+        )
+        if not latest or not isinstance(version_meta, dict):
+            reason = doc.get("error") or "响应中缺少 dist-tags.latest"
+            raise RuntimeError(
+                f"无法从 npm registry 获取 tencent-channel-cli 最新版本：{reason}"
+            )
 
-        optional = version_meta.get("optionalDependencies") or {}
+        optional = version_meta.get("optionalDependencies")
+        if not isinstance(optional, dict):
+            optional = {}
         pkg_version = str(optional.get(package) or latest)
         tarball = (
             f"https://registry.npmjs.org/{package}/-/{package}-{pkg_version}.tgz"

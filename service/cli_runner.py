@@ -12,7 +12,11 @@ from .cli_binary import CliBinaryManager
 
 
 class CliError(RuntimeError):
-    """CLI 执行/解析错误，携带原始输出便于上层做容错重试。"""
+    """CLI 执行/解析错误，携带原始输出便于上层做容错重试。
+
+    ``definite``：True 表示这是服务端/CLI 的明确业务拒绝，能够确认没有创建帖子；
+    False（默认）表示通信/解析/未知层错误，上层不得据此放开防抖（RT-02）。
+    """
 
     def __init__(
         self,
@@ -22,6 +26,7 @@ class CliError(RuntimeError):
         stdout: str = "",
         stderr: str = "",
         payload=None,
+        definite: bool | None = None,
     ):
         super().__init__(message)
         self.message = message
@@ -29,10 +34,47 @@ class CliError(RuntimeError):
         self.stdout = stdout
         self.stderr = stderr
         self.payload = payload
+        # RT02-F1：非零退出码本身不能证明“服务器没有创建帖子”——CLI 可能在
+        # 成功建帖后被 kill（rc=137）或崩溃。只有结构化业务 payload 明确表达
+        # “服务器拒绝了请求”才视为 definite（确定没建帖）。通信层错误一律非 definite。
+        if definite is None:
+            self.definite = bool(self._find_error_payload(payload))
+        else:
+            self.definite = definite
+
+    @staticmethod
+    def _find_error_payload(payload) -> object | None:
+        if not isinstance(payload, dict):
+            return None
+        if _is_false(payload.get("success")):
+            return payload
+        data = payload.get("data")
+        if isinstance(data, dict):
+            if _as_error_code(data.get("retCode", data.get("retcode"))) is not None:
+                return data
+            if _is_false(data.get("success")):
+                return data
+        return None
+
+
+class CliOutputError(CliError):
+    """CLI 进程已执行、但输出无法解读（非 JSON / 结构异常 / 空结果等）。
+
+    对投稿类命令而言，进程已经拿到视频并开始处理，输出无法解读不代表服务端
+    没有创建帖子 —— 上层必须按「结果未知」对待，绝不能据此放开防抖允许重发。
+    """
 
 
 class AlreadyLoggedInError(CliError):
-    """CLI 当前已登录；需要先登出或用 --yes 覆盖重新登录。"""
+    """CLI 当前已登录；需要先登出或用 --yes 覆盖重新登录（仅限登录命令）。"""
+
+
+class CliTimeoutError(CliError):
+    """CLI 执行超时。
+
+    对上传类命令而言超时只代表「结果未知」（帖子可能已经发出），
+    上层需要据此避免让用户盲目重试造成重复发帖。
+    """
 
 
 @dataclass(slots=True)
@@ -43,6 +85,46 @@ class RunOutput:
     returncode: int
     stdout: str
     stderr: str
+
+
+def _is_false(value: object) -> bool:
+    """把「success 字段表达失败」的多种写法归一化。
+
+    上游 JSON 形态会变（false / 0 / "false"），只判断 `is False`
+    会把已经失败的调用当成成功，进而向用户回执「✅ 已上传」。
+    字段缺失（None）时不猜测，返回 False。
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, (int, float)):
+        return value == 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"false", "0", "no"}
+    return False
+
+
+def _as_error_code(value: object) -> object | None:
+    """把 retCode 归一化：无错误返回 None，有错误返回可展示的原值。
+
+    `"0"` 这类字符串数字必须与 0 等价，否则会把成功调用误判为失败。
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value or None
+    if isinstance(value, (int, float)):
+        return None if value == 0 else value
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            number = int(text)
+        except ValueError:
+            # 非数字取值：只放行明确表达成功的写法，其余按异常码处理
+            return None if text.lower() in {"ok", "success", "true"} else value
+        return None if number == 0 else value
+    return value
 
 
 class CliRunner:
@@ -73,6 +155,7 @@ class CliRunner:
 
         argv = (binary, *args)
         timeout = timeout or self.cfg.cli_timeout
+        proc = None
 
         if input_data:
             proc = await asyncio.create_subprocess_exec(
@@ -100,10 +183,16 @@ class CliRunner:
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
-            raise CliError(
+            raise CliTimeoutError(
                 f"tencent-channel-cli 执行超时（>{timeout}s）",
                 returncode=None,
             ) from None
+        except asyncio.CancelledError:
+            # 任务被取消（如插件重载/停止）时也要回收子进程，避免 CLI 残留
+            if proc is not None:
+                proc.kill()
+                await proc.wait()
+            raise
 
         return RunOutput(
             args=argv,
@@ -137,15 +226,18 @@ class CliRunner:
         payload = self.parse_json(out.stdout)
         error = self._find_business_error(payload)
         if error:
+            # 服务端明确拒绝（success=false / retCode 非 0 + 业务 payload）：
+            # 这是「确定没有创建帖子」的证据，标记 definite=True 供上层释放防抖。
             raise CliError(
                 f"tencent-channel-cli 返回错误：{error}",
                 returncode=out.returncode,
                 stdout=out.stdout,
                 stderr=out.stderr,
                 payload=payload,
+                definite=True,
             )
         if not isinstance(payload, dict):
-            raise CliError(
+            raise CliOutputError(
                 f"tencent-channel-cli 返回结构异常: {out.stdout[:500]}",
                 stdout=out.stdout,
                 stderr=out.stderr,
@@ -172,7 +264,7 @@ class CliRunner:
                     return json.loads(text[start : end + 1])
                 except json.JSONDecodeError:
                     pass
-            raise CliError(f"tencent-channel-cli 返回了非 JSON 内容: {text[:500]}")
+            raise CliOutputError(f"tencent-channel-cli 返回了非 JSON 内容: {text[:500]}")
 
     @staticmethod
     def _find_business_error(payload) -> str | None:
@@ -180,18 +272,18 @@ class CliRunner:
         if not isinstance(payload, dict):
             return None
 
-        if payload.get("success") is False:
+        if _is_false(payload.get("success")):
             return str(payload.get("message") or payload.get("error") or payload)
 
         data = payload.get("data", payload)
         if isinstance(data, dict):
-            ret_code = data.get("retCode", data.get("retcode"))
-            if ret_code not in (None, 0):
+            ret_code = _as_error_code(data.get("retCode", data.get("retcode")))
+            if ret_code is not None:
                 return (
-                    f"retCode={ret_code}："
+                    f"retCode={data.get('retCode', data.get('retcode'))}："
                     f"{data.get('msg') or data.get('message') or data.get('error') or payload}"
                 )
-            if data.get("success") is False:
+            if _is_false(data.get("success")):
                 return str(
                     data.get("message") or data.get("error") or data
                 )

@@ -31,6 +31,15 @@ class Video(Struct):
     cover: Cover
     duration: int
 
+    @property
+    def duration_s(self) -> float:
+        """时长（秒）。
+
+        抖音接口里的 duration 是毫秒，而 VideoContent.duration 约定为秒
+        （与 B站解析器保持一致）。不换算会让时长上限判断放大 1000 倍。
+        """
+        return self.duration / 1000
+
 
 class Image(Struct):
     video: Video | None = None

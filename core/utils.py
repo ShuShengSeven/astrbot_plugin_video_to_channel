@@ -38,12 +38,23 @@ async def safe_unlink(path: Path):
         logger.warning(f"删除 {path} 失败")
 
 
+async def safe_rmtree(path: Path):
+    """递归删除目录（用于任务级唯一工作目录的清理）。"""
+    import shutil
+
+    try:
+        await asyncio.to_thread(shutil.rmtree, path, ignore_errors=True)
+    except Exception:
+        logger.warning(f"删除目录 {path} 失败")
+
+
 async def exec_ffmpeg_cmd(cmd: list[str]) -> None:
     """执行命令
 
     Args:
         cmd (list[str]): 命令序列
     """
+    process = None
     try:
         process = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -52,6 +63,11 @@ async def exec_ffmpeg_cmd(cmd: list[str]) -> None:
         return_code = process.returncode
     except FileNotFoundError:
         raise RuntimeError("ffmpeg 未安装或无法找到可执行文件")
+    except asyncio.CancelledError:
+        if process is not None:
+            process.kill()
+            await process.wait()
+        raise
 
     if return_code != 0:
         error_msg = stderr.decode().strip()
@@ -71,11 +87,9 @@ async def merge_av(
         a_path (Path): 音频文件路径
         output_path (Path): 输出文件路径
     """
-    target_path = output_path
-    if output_path in (v_path, a_path):
-        output_path = output_path.with_name(
-            f"{output_path.stem}_merged{output_path.suffix}"
-        )
+    # 先写临时文件再原子替换到最终路径，避免 ffmpeg 失败/中断时留下半截“成品”
+    # 最终路径允许等于 v_path/a_path：ffmpeg 读取完成后用 os.replace 原子覆盖源文件
+    tmp_path = output_path.with_name(f"{output_path.stem}.part{output_path.suffix}")
     logger.info(f"Merging {v_path.name} and {a_path.name} to {output_path.name}")
 
     cmd = [
@@ -91,17 +105,30 @@ async def merge_av(
         "0:v:0",
         "-map",
         "1:a:0",
-        str(output_path),
+        str(tmp_path),
     ]
 
-    await exec_ffmpeg_cmd(cmd)
-    if output_path != target_path:
-        await safe_unlink(target_path)
-        await asyncio.to_thread(output_path.replace, target_path)
-        output_path = target_path
+    try:
+        await exec_ffmpeg_cmd(cmd)
+    except asyncio.CancelledError:
+        await safe_unlink(tmp_path)
+        raise
+    except Exception:
+        await safe_unlink(tmp_path)
+        raise
+
+    try:
+        await asyncio.to_thread(tmp_path.replace, output_path)
+    except asyncio.CancelledError:
+        await safe_unlink(tmp_path)
+        raise
+    except Exception:
+        await safe_unlink(tmp_path)
+        raise
+
     cleanup = [p for p in (v_path, a_path) if p != output_path]
     await asyncio.gather(*(safe_unlink(p) for p in cleanup))
-    logger.info(f"Merged {output_path.name}, {fmt_size(output_path)}")
+
 
 
 async def merge_av_h264(

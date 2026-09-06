@@ -81,7 +81,7 @@ class KuaiShouParser(BaseParser):
             self.create_video_content(
                 video_url,
                 cover_url,
-                photo.duration,
+                photo.duration_s,
                 headers=self.ios_headers,
             )
         ]
@@ -113,6 +113,15 @@ class Photo(Struct):
     head_url: str | None = field(default=None, name="headUrl")
     cover_urls: list[CdnUrl] = field(name="coverUrls", default_factory=list)
     main_mv_urls: list[CdnUrl] = field(name="mainMvUrls", default_factory=list)
+
+    @property
+    def duration_s(self) -> float:
+        """时长（秒）。
+
+        快手页面里的 duration 单位是毫秒，而 VideoContent.duration 约定为秒
+        （与 B站解析器保持一致）。不转换会让一切基于时长的判断放大 1000 倍。
+        """
+        return self.duration / 1000
 
     @property
     def name(self) -> str:

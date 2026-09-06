@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import calendar
+import re
 import time
 from dataclasses import dataclass
 from http import cookiejar
@@ -9,6 +11,47 @@ from urllib.parse import urlparse
 from astrbot.api import logger
 
 from .config import ParserItem, PluginConfig
+
+# Cookie 的 Expires 头恒为 GMT/UTC，而 time.mktime() 会按“本地时区”解释结构体，
+# 在 UTC+8 机器上会把过期时间算早 8 小时：长寿命 Cookie 只是提前失效，
+# 短寿命票据则会立刻被判为过期（表现为“Cookie 明明填了却仍被风控”）。
+_EXPIRY_FORMATS = (
+    "%a, %d-%b-%Y %H:%M:%S %Z",
+    "%a, %d %b %Y %H:%M:%S %Z",
+    "%a, %d-%b-%y %H:%M:%S %Z",
+    "%a, %d %b %Y %H:%M:%S %z",
+    "%a, %d-%b-%Y %H:%M:%S %z",
+)
+_MAX_AGE_RE = re.compile(r"-?\d+")
+
+
+def parse_cookie_expires(value: str) -> int:
+    """把 Expires 头解析成 UTC 秒级时间戳；无法解析时返回 0（视为会话 Cookie）。"""
+    text = (value or "").strip()
+    if not text:
+        return 0
+    for fmt in _EXPIRY_FORMATS:
+        try:
+            parsed = time.strptime(text, fmt)
+        except ValueError:
+            continue
+        gmtoff = getattr(parsed, "tm_gmtoff", None) or 0
+        return calendar.timegm(parsed[:9]) - int(gmtoff)
+    logger.debug(f"无法解析 Cookie Expires 头: {text!r}，按会话 Cookie 处理")
+    return 0
+
+
+def resolve_expiry(morsel, now: int | None = None) -> int:
+    """按 RFC 6265 计算过期时间戳：Max-Age 优先于 Expires。"""
+    current = int(time.time()) if now is None else now
+    raw_max_age = morsel["max-age"]
+    if raw_max_age:
+        matched = _MAX_AGE_RE.search(str(raw_max_age))
+        if matched:
+            age = int(matched.group(0))
+            # 非正数表示要求删除该 Cookie，给一个必然过期的时间戳
+            return current + age if age > 0 else 1
+    return parse_cookie_expires(morsel["expires"] or "")
 
 
 @dataclass(slots=True)
@@ -359,21 +402,7 @@ class CookieJar:
                 domain = morsel["domain"] or f".{self.domain}"
                 secure = bool(morsel["secure"])
 
-                expires = 0
-                if morsel["expires"]:
-                    try:
-                        expires = int(
-                            time.mktime(
-                                time.strptime(
-                                    morsel["expires"], "%a, %d-%b-%Y %H:%M:%S %Z"
-                                )
-                            )
-                        )
-                    except Exception as e:
-                        logger.debug(
-                            f"解析 expires 失败: {morsel['expires']}，错误: {e}"
-                        )
-                        expires = 0
+                expires = resolve_expiry(morsel)
 
                 existing = next(
                     (

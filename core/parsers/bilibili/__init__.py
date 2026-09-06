@@ -33,6 +33,20 @@ class BilibiliParser(BaseParser):
     # 平台信息
     platform: ClassVar[Platform] = Platform(name="bilibili", display_name="B站")
 
+    # 这些入口解析出来必然不是可搬运的单条视频（音频/动态/直播/收藏夹/专栏），
+    # 以前也会触发“开始解析→再回执不支持”，既刷屏又误导。路由阶段直接不匹配。
+    non_portable_keywords: ClassVar[frozenset[str]] = frozenset(
+        {
+            "bm",  # 纯音频
+            "/dynamic/",
+            "t.bili",
+            "live.bili",
+            "/favlist",
+            "/read/",
+            "/opus/",
+        }
+    )
+
     def __init__(self, config: PluginConfig, downloader: Downloader):
         super().__init__(config, downloader)
         self.mycfg = config.parser.bilibili
@@ -417,21 +431,49 @@ class BilibiliParser(BaseParser):
 
         # 获取下载数据
         download_url_data = await video.get_download_url(page_index=page_index)
-        # Normalize hvc1 streams so bilibili-api can recognize them as HEV.
-        for video_data in download_url_data.get("dash", {}).get("video", []):
-            codecs = video_data.get("codecs", "")
-            if isinstance(codecs, str) and codecs.startswith("hvc1"):
-                video_data["codecs"] = f"hev,{codecs}"
+        if not isinstance(download_url_data, dict):
+            raise DownloadException(
+                f"B站未返回下载数据（{type(download_url_data).__name__}）"
+            )
+
+        # dash 可能整体为 null，也可能是 durl 分段形态（旧/特殊视频），
+        # 这两种都是合法上游响应。之前直接 .get("dash", {}).get("video") 会在
+        # dash=null 时抛 AttributeError，用户只看到“视频搬运失败：NoneType ...”。
+        dash = download_url_data.get("dash")
+        if not isinstance(dash, dict):
+            dash = None
+        if dash is not None:
+            # Normalize hvc1 streams so bilibili-api can recognize them as HEV.
+            video_streams = dash.get("video")
+            for video_data in video_streams if isinstance(video_streams, list) else []:
+                if not isinstance(video_data, dict):
+                    continue
+                codecs = video_data.get("codecs", "")
+                if isinstance(codecs, str) and codecs.startswith("hvc1"):
+                    video_data["codecs"] = f"hev,{codecs}"
+        elif not download_url_data.get("durl"):
+            raise DownloadException(
+                "B站未返回可下载的流信息（dash/durl 均为空），可能是会员/版权/区域限制"
+            )
+
         detecter = VideoDownloadURLDataDetecter(download_url_data)
-        streams = detecter.detect_best_streams(
-            video_max_quality=self.video_quality,
-            codecs=self.video_codecs,
-            no_dolby_video=True,
-            no_hdr=True,
-        )
-        dash_data = download_url_data.get("dash") or {}
+        try:
+            streams = detecter.detect_best_streams(
+                video_max_quality=self.video_quality,
+                codecs=self.video_codecs,
+                no_dolby_video=True,
+                no_hdr=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            # 上游按所选清晰度/编码找不到流时抛的是内部异常，转成可执行的提示
+            raise DownloadException(
+                f"未找到符合条件的视频流（清晰度 {self.video_quality} / "
+                f"编码 {self.video_codecs} 可能无对应流，可在插件配置中调整）：{e}"
+            ) from e
         if not streams:
-            raise DownloadException("未找到可下载的视频流（可能是所选编码无对应流）")
+            raise DownloadException(
+                "未找到可下载的视频流（可能是所选编码无对应流，可在插件配置中调整清晰度/编码）"
+            )
         video_stream = streams[0]
         if isinstance(video_stream, MP4StreamDownloadURL):
             return video_stream.url, None

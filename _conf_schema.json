@@ -7,7 +7,7 @@
   },
   "debounce_seconds": {
     "description": "同一链接防抖秒数",
-    "hint": "同一会话内同一链接在窗口期内只处理一次，避免刷屏。0 表示关闭防抖。",
+    "hint": "全局范围内同一链接在窗口期内只处理一次（跨会话去重），避免重复上传。0 表示关闭防抖。",
     "type": "int",
     "slider": {
       "min": 0,
@@ -111,7 +111,7 @@
       },
       "proxy": {
         "description": "代理地址",
-        "hint": "如 http://127.0.0.1:7890，留空为直连。",
+        "hint": "如 http://127.0.0.1:7890，留空为直连。始终作用于托管 CLI 的 npm 下载；对各平台解析/视频下载，还需在 parsers.<平台>.use_proxy 中显式开启。",
         "type": "string",
         "default": ""
       }
@@ -129,6 +129,12 @@
             "description": "启用 B站解析",
             "type": "bool",
             "default": true
+          },
+          "use_proxy": {
+            "description": "B站解析/下载使用代理",
+            "hint": "默认关闭（与历史行为一致）。开启后 download.proxy 才会作用于 B站的接口与视频/封面下载；B站对海外出口常返回 -352/-403，请确认代理可用后再开启。",
+            "type": "bool",
+            "default": false
           },
           "cookies": {
             "description": "B站 Cookie（可选）",
@@ -175,6 +181,12 @@
             "type": "bool",
             "default": true
           },
+          "use_proxy": {
+            "description": "抖音解析/下载使用代理",
+            "hint": "默认关闭。开启后 download.proxy 才会作用于抖音的接口与视频/封面下载。",
+            "type": "bool",
+            "default": false
+          },
           "cookies": {
             "description": "抖音 Cookie（可选）",
             "hint": "匿名状态通常也能解析，遇到风控时填写 Cookie。",
@@ -192,6 +204,12 @@
             "description": "启用快手解析",
             "type": "bool",
             "default": true
+          },
+          "use_proxy": {
+            "description": "快手解析/下载使用代理",
+            "hint": "默认关闭。开启后 download.proxy 才会作用于快手的接口与视频/封面下载。",
+            "type": "bool",
+            "default": false
           },
           "cookies": {
             "description": "快手 Cookie（可选）",

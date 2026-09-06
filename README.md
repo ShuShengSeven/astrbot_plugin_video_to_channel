@@ -66,6 +66,7 @@ core/  (移植自 astrbot_plugin_parser)
 | `parsers.bilibili` | B站开关、Cookie、清晰度、编码 |
 | `parsers.douyin` | 抖音开关、Cookie（可选） |
 | `parsers.kuaishou` | 快手开关、Cookie（可选） |
+| `parsers.*.use_proxy` | 该平台的解析/下载是否使用 `download.proxy`；**默认关闭**，与历史行为一致 |
 
 ## 私聊管理指令（ADMIN + 私聊）
 
@@ -102,13 +103,33 @@ core/  (移植自 astrbot_plugin_parser)
 - 抖音：分享口令中的 `https://v.douyin.com/xxx`、`https://www.douyin.com/video/<id>` 等
 - 快手：`https://v.kuaishou.com/xxx` 短链、`https://www.kuaishou.com/short-video/<id>`、`https://v.m.chenzhongtech.com/fw/...` 等
 
-插件会回执“开始解析…”，完成后回执上传结果（含分享链接）。
+插件会在**真正开始处理时**回执“开始解析…”，完成后回执上传结果（含分享链接）。
+
+> 不支持的链接（B站动态/直播/收藏夹/专栏/纯音频）在**触发阶段**就被过滤，插件完全不会响应，
+> 避免“先回执开始解析、再回执不支持”的误导。
 
 ## 行为说明与限制
 
 - 上传帖子内容默认使用解析出的视频标题作为正文；单条视频时按腾讯频道规则不强制长帖标题，CLI 会根据视频参数自动处理。
-- 图文、音频、多视频等解析结果 v1 不搬运（会明确提示），后续可扩展；其中快手图文/图集会直接提示“暂不支持，仅搬运视频”。
-- 同一链接在防抖窗口内重复发送会被静默跳过。
+- 图文、音频、多视频等解析结果 v1 不搬运，会明确提示；其中快手图集直接提示“暂不支持，仅搬运视频”。
+  **多视频作品现在会被拒绝**（不再“只搬第一条却回执成功”）。
+- 时长限制 `download.max_minutes` 对 B站/抖音/快手**统一生效**（内部时长一律换算成秒比较），
+  超限时会在下载前就提示“视频时长超过限制”。
+- 同一链接在防抖窗口内（全局、跨会话）重复发送会被静默跳过；同一链接正在处理时也不会重复触发。
+  跳过的请求**不会**再收到“开始解析”的承诺式回执。
+- 失败后的重试策略与投稿状态一致：解析/下载/超限/被 CLI 明确拒绝（服务端确认未建帖）等
+  **确定没有产生帖子**的失败，会立即放开防抖允许重试；而 CLI **超时、输出无法解析、通信中断**
+  属于“结果未知”，会保留防抖并提示你先去频道核实，避免重发造成重复投稿。
+- 插件配置保存会触发 AstrBot 重载插件。若某条链接在**投稿阶段**因重载被中断（结果未知），
+  插件会把该链接记为 UNKNOWN 并**持久化到插件数据目录**（`plugin_data/.../unknown_submits.json`），
+  冷却期至少 5 分钟；重载后的新实例不会立刻接受同一链接，避免重复投稿。
+- B站高清音视频合流使用**任务级唯一工作目录**（`cache/<产物名>-<随机>/`），并发搬运同一
+  视频的不同链接形态时，v/a 分片与 ffmpeg 临时文件互不干扰；异常/取消后工作目录会被清理，
+  崩溃残留的过期工作目录会在下次启动时回收。
+- `download.proxy` 对某平台的解析/下载生效的前提是该平台的 `parsers.<平台>.use_proxy` 已开启
+  （默认关闭，与历史行为一致）；它始终作用于托管 CLI 的 npm 下载。
+- `debounce_seconds=0`（关闭防抖）与 `download.download_retry_times=0`（不重试）现在按字面生效；
+  修复前 0 会被当作“未填写”而回落成 120 / 2。首次加载时插件会打 WARNING 提示这一变化。
 - 上传成功后会清理本地临时文件（位于 AstrBot `data/plugin_data/astrbot_plugin_video_to_channel/cache/`）；托管 CLI 位于同目录 `bin/`。
 
 ## 开发
@@ -117,8 +138,11 @@ core/  (移植自 astrbot_plugin_parser)
 # 语法检查（无需安装 AstrBot 依赖）
 python3 -m py_compile main.py core/*.py core/parsers/*.py core/parsers/bilibili/*.py core/parsers/douyin/*.py service/*.py
 
-# 服务层单元测试（使用 fake CLI，无需真实登录/网络）
+# 服务层 + 入口层回归测试（使用 fake CLI 与 astrbot 桩，无需真实登录/网络）
 python3 tests/test_service.py
+# 覆盖：防抖时钟/配置 0 值语义/流水线回执与防抖一致性/时长与多视频策略/
+#       媒体任务释放/平台故障隔离/B站 dash-durl 形态/CLI 错误归一化/
+#       Cookie 过期时区/登录二维码轮询/main.on_message 与 _friendly_error
 
 # 格式化建议使用 ruff
 ruff format .

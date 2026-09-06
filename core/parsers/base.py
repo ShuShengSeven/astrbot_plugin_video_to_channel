@@ -63,6 +63,14 @@ class BaseParser:
     platform: ClassVar[Platform]
     """ 平台信息（包含名称和显示名称） """
 
+    non_portable_keywords: ClassVar[frozenset[str]] = frozenset()
+    """结构上永远搬不进腾讯频道的 handler 关键词（图文/音频/直播/收藏夹等）。
+
+    本插件是“上传中心”而非“渲染中心”：这些链接解析成功也只会得到“不搬运”的回执，
+    既刷屏又给用户“插件坏了”的错觉。路由层会跳过它们，做到不触发、不打扰。
+    注意这里只影响外部消息的入口匹配，不影响 parse_with_redirect 内部的 search_url。
+    """
+
     if TYPE_CHECKING:
         _key_patterns: ClassVar[KeyPatterns]
         _handlers: ClassVar[dict[str, HandlerFunc]]
@@ -155,6 +163,13 @@ class BaseParser:
             raise ParseException(f"无法重定向 URL: {url}")
 
         keyword, searched = self.search_url(redirect_url)
+        if keyword in self.non_portable_keywords:
+            # RT-06：短链（b23.tv 等）重定向后可能落到动态/直播/收藏夹/专栏/音频等
+            # 不可搬运入口。路由阶段只看见了短链关键词，这里才是第二次匹配；
+            # 若不拦截，会走完整解析再回执失败，既刷屏又误导。
+            raise ParseException(
+                f"{redirect_url} 指向的内容类型暂不支持搬运（仅支持单条视频）"
+            )
         return await self.parse(keyword, searched)
 
     @classmethod

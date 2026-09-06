@@ -8,7 +8,17 @@ from astrbot.api import logger
 
 from ..core.config import PluginConfig
 from .cli_binary import CliBinaryManager
-from .cli_runner import CliError, CliRunner
+from .cli_runner import CliError, CliOutputError, CliRunner, CliTimeoutError
+
+
+class PublishResultUnknownError(CliError):
+    """投稿已进入 CLI 阶段但结果无法核对。
+
+    与 CliTimeoutError 同属「结果未知」：帖子可能已经发出，
+    上层不能按“确定失败”放开防抖、也不能回执“已上传”。
+    这个类型会在 channel_uploader 内部对“已开始提交”的未知错误统一收敛，
+    因此 pipeline 只需关心一种“投稿结果未知”异常，而不必理解 CLI 的每种坏法。
+    """
 
 
 @dataclass(slots=True)
@@ -86,16 +96,58 @@ class ChannelUploader:
                 if cleaned != content:
                     logger.warning("[uploader] 标题含 Markdown 语法，已清理后重试")
                     return await self.publish_video(video_path, content=cleaned)
+            # 进程已带着视频启动（spawn 成功、参数合法）后，任何“输出无法解读/
+            # 通信中断”都意味着服务端可能已经收到帖子 —— 一律收敛为结果未知，
+            # 不让上层把通信层错误误判成“确定没投稿”。
+            if isinstance(e, CliTimeoutError):
+                raise
+            if isinstance(e, (CliOutputError, PublishResultUnknownError)):
+                raise PublishResultUnknownError(str(e)) from e
+            # 其余 CliError（含返回码非 0 且有业务 payload）由调用方按业务拒绝处理。
             raise
 
-        data = payload.get("data", payload) if isinstance(payload, dict) else payload
+        if not isinstance(payload, dict):
+            raise CliOutputError(f"无法解析 CLI 返回结果: {payload}")
+
+        # RT02-F2：success=true 本身不能作为投稿成功凭证。必须有明确成功证据：
+        # 优先取 data（须为 dict 且含 feed_id/share_url）；同时兼容 CLI 直接把
+        # 业务结果放顶层（unwrap_data 曾支持的形态，data 键缺失时顶层含 feed_id/
+        # share_url 也算成功证据）。其余一律 UNKNOWN —— 无法确认帖子已创建。
+        data = payload.get("data")
         if not isinstance(data, dict):
-            raise CliError(f"无法解析 CLI 返回结果: {payload}")
+            # data 缺失/非对象：看顶层是否有直接证据
+            feed_id = self._first_of(payload, "feed_id", "id")
+            share_url = self._first_of(payload, "share_url", "url", "short_url")
+            if feed_id or share_url:
+                return PublishResult(
+                    raw=payload,
+                    feed_id=feed_id,
+                    share_url=share_url,
+                )
+            raise PublishResultUnknownError(
+                "tencent-channel-cli 未返回可核对的结果数据，无法确认帖子是否发布成功；"
+                "请先去目标频道核实，确认后再重试。"
+            )
+
+        # data 存在且为对象，但仍可能是空对象（无任何投稿证据）
+        if not data:
+            raise PublishResultUnknownError(
+                "tencent-channel-cli 返回的 data 为空，无法确认帖子是否发布成功；"
+                "请先去目标频道核实，确认后再重试。"
+            )
+
+        feed_id = self._first_of(data, "feed_id", "id")
+        share_url = self._first_of(data, "share_url", "url", "short_url")
+        if not feed_id and not share_url:
+            raise PublishResultUnknownError(
+                f"tencent-channel-cli 返回结果中没有 feed_id/share_url，无法确认帖子"
+                f"是否发布成功：{data}；请先去目标频道核实，确认后再重试。"
+            )
 
         return PublishResult(
             raw=data,
-            feed_id=self._first_of(data, "feed_id", "id"),
-            share_url=self._first_of(data, "share_url", "url", "short_url"),
+            feed_id=feed_id,
+            share_url=share_url,
         )
 
     # ------------------------------------------------------------------

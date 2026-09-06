@@ -78,7 +78,6 @@ class DouyinParser(BaseParser):
 
     # https://www.douyin.com/video/7521023890996514083
     # https://www.douyin.com/note/7469411074119322899
-    @handle("", r"(?<![A-Za-z0-9_/=:%?&.-])(?P<vid>\d{18,20})(?!\d)")
     @handle("aweme_id", r"aweme_id[=:/\s]+(?P<vid>\d{10,})")
     @handle("aweme", r"aweme/(?P<vid>\d{10,})")
     @handle("douyin", r"douyin\.com/(?P<ty>video|note)/(?P<vid>\d+)")
@@ -194,6 +193,10 @@ class DouyinParser(BaseParser):
             raise ParseException(f"无法重定向 URL: {url}")
 
         keyword, searched = self.search_url(redirect_url)
+        if keyword in self.non_portable_keywords:
+            raise ParseException(
+                f"{redirect_url} 指向的内容类型暂不支持搬运（仅支持单条视频）"
+            )
         return await self.parse(keyword, searched)
 
     async def parse_video(self, url: str):
@@ -242,8 +245,10 @@ class DouyinParser(BaseParser):
         # 添加视频内容
         elif video_data.video:
             cover_url = video_data.cover_url
-            duration = video_data.video.duration if video_data.video else 0
-            logger.debug(f"[抖音] 检测到视频内容，时长: {duration}秒")
+            # duration 已在 Video 结构里换算为秒（接口原值是毫秒），
+            # 与 VideoContent.duration 的“秒”约定以及 download.max_minutes 判断保持一致。
+            duration = video_data.video.duration_s
+            logger.debug(f"[抖音] 检测到视频内容，时长: {duration:.1f}秒")
             video_headers = self._build_media_headers(url)
             video_url = None
             if play_token := video_data.play_token:

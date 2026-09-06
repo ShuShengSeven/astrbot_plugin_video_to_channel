@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import base64
+import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+
 from ..core.config import PluginConfig
+from ..core.utils import safe_unlink
 from .cli_runner import AlreadyLoggedInError, CliError, CliRunner
 
 
@@ -26,6 +30,7 @@ class PollResult:
     authorized: bool
     message: str
     raw: Any = None
+    expired: bool = False
 
 
 @dataclass(slots=True)
@@ -123,6 +128,29 @@ def text_says_logged_in(text: str) -> bool:
     return any(marker in lowered for marker in _POSITIVE_TEXT_MARKERS)
 
 
+# 「二维码已过期 / 已被领取 / expired」这类文案用于终止轮询。
+# 不能简单用子串判断：CLI 若回一句「token 未过期」也会被 “过期” 二字命中，
+# 从而把还在有效期内的登录流程误判为失效（反之亦然）。
+_EXPIRED_MARKERS = ("expired", "已失效", "已被领取")
+# 覆盖 “未过期 / 没过期 / 没有过期 / 尚未过期 / 并未过期 / 无过期” 等正向表述
+_NEGATED_EXPIRY = re.compile(r"[未没无][^过]{0,1}\S{0,2}过期")
+
+
+def is_qr_expired_text(text: str) -> bool:
+    """判断 CLI 文本是否表达「二维码已失效」。"""
+    if not text:
+        return False
+    lowered = text.lower()
+    if any(marker in lowered for marker in _EXPIRED_MARKERS):
+        return True
+    compact = text.replace("\u3000", "")
+    for match in re.finditer("过期", compact):
+        if _NEGATED_EXPIRY.search(compact[max(0, match.start() - 3) : match.end()]):
+            continue
+        return True
+    return False
+
+
 def collect_message(obj: Any) -> str:
     """尽力从结果中提取可读消息。"""
     if not isinstance(obj, dict):
@@ -149,6 +177,10 @@ class CliAccount:
         """
         qrcode_path = self.cfg.data_dir / "login_qrcode.png"
         qrcode_path.parent.mkdir(parents=True, exist_ok=True)
+        # 上一次登录留下的二维码必须删掉：CLI 本次没有成功写图时，
+        # 旧文件会被当作“新二维码”发给用户，扫码必然失败。
+        if qrcode_path.exists():
+            await safe_unlink(qrcode_path)
 
         args = ["login", "--json", "--qrcode-path", str(qrcode_path)]
         if relogin:
@@ -169,11 +201,23 @@ class CliAccount:
         data = unwrap_data(payload)
 
         verification_uri = str(first_value(data, "verification_uri") or "")
-        expires_in_s = int(first_value(data, "expires_in_s") or 120)
         try:
-            interval = float(first_value(data, "interval") or 3)
+            expires_in_s = int(first_value(data, "expires_in_s") or 120)
+        except (TypeError, ValueError):
+            expires_in_s = 120
+        raw_interval = first_value(data, "interval")
+        try:
+            interval = float(raw_interval) if raw_interval not in (None, "") else 3.0
         except (TypeError, ValueError):
             interval = 3.0
+        # RT-04：轮询间隔安全归一化，最终区间 [1.0, 15.0]，且不超过 expires/2。
+        # - 缺失/0/负数/NaN/inf -> 默认 1.0s（不忙等、不崩 sleep）；
+        # - 过大值 -> 上限 15s，且受 max(1, expires/2) 约束，保证有效期内至少轮询 2 次；
+        # - 设计下限明确为 1.0s（对 CLI 友好），return 处不再二次抬升。
+        if not math.isfinite(interval) or interval <= 0:
+            interval = 1.0
+        interval = min(interval, 15.0, max(1.0, expires_in_s) / 2)
+        interval = max(1.0, interval)
 
         if not qrcode_path.exists():
             qr_b64 = first_value(data, "qr_code", "qrcode")
@@ -192,22 +236,35 @@ class CliAccount:
             verification_uri=verification_uri,
             qrcode_path=qrcode_path,
             expires_in_s=max(30, expires_in_s),
-            interval=max(1.0, interval),
+            interval=interval,
         )
 
     @staticmethod
+    @staticmethod
     def _is_already_logged_in_error(e: CliError) -> bool:
-        """识别 CLI 的“当前已登录，请加 --yes 重登”类错误（退出码 5）。"""
-        text = f"{e}\n{e.stdout}\n{e.stderr}"
-        return (
-            e.returncode == 5
-            or "当前已登录" in text
-            or ("已登录" in text and "--yes" in text)
-        )
+        """识别 CLI 的“当前已登录，请加 --yes 重登”类错误。
 
-    async def poll_login(self) -> PollResult:
-        """轮询一次登录结果（未扫码时不会抛错）。"""
-        out = await self.runner.run(["login", "poll-token", "--json"])
+        RT-09：仅靠“文案里有 已登录”不可靠——可能吞掉真实登录错误。
+        只认结构化证据：
+        - 退出码 5（CLI 约定的“已登录需 --yes”码，测试桩同此语义）；
+        - 或同时出现“已登录”与“--yes”（只有提示重登才会同时出现）。
+        单独“当前已登录”不再足以判定。
+        """
+        text = f"{e}\n{e.stdout}\n{e.stderr}"
+        if e.returncode == 5:
+            return True
+        return "--yes" in text and ("已登录" in text or "logged in" in text.lower())
+
+    async def poll_login(self, timeout: int | None = None) -> PollResult:
+        """轮询一次登录结果（未扫码时不会抛错）。
+
+        timeout 由调用方按二维码剩余有效期传入：CLI 的 poll-token 可能是长轮询，
+        若不单独限时，一次轮询就能占满 cli_timeout（默认 600s），
+        让上层的超时/失效判断形同虚设。
+        """
+        out = await self.runner.run(
+            ["login", "poll-token", "--json"], timeout=timeout
+        )
         text = f"{out.stdout}\n{out.stderr}".strip()
 
         try:
@@ -218,13 +275,21 @@ class CliAccount:
         authorized = contains_status(payload, "authorized") or (
             payload is None and '"authorized"' in text
         )
-        expired = "过期" in text or "已被领取" in text
+        expired = (
+            is_qr_expired_text(text)
+            or contains_status(payload, "expired")
+        )
         message = collect_message(unwrap_data(payload) if payload else {}) or text
 
         if authorized:
             return PollResult(authorized=True, message=message, raw=payload)
         if expired:
-            return PollResult(authorized=False, message="二维码已过期，请重新 /v2c login", raw=payload)
+            return PollResult(
+                authorized=False,
+                message="二维码已过期，请重新 /v2c login",
+                raw=payload,
+                expired=True,
+            )
         return PollResult(authorized=False, message=message, raw=payload)
 
     async def login_status(self) -> LoginStatus:
