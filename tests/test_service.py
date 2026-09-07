@@ -819,7 +819,11 @@ from astrbot_plugin_video_to_channel.service.cli_account import (
     PollResult,
     is_qr_expired_text,
 )
-from astrbot_plugin_video_to_channel.service.cli_runner import CliTimeoutError
+from astrbot_plugin_video_to_channel.service.cli_runner import (
+    CliOutputError,
+    CliSpawnError,
+    CliTimeoutError,
+)
 from astrbot_plugin_video_to_channel.service.channel_uploader import (
     PublishResult,
     PublishResultUnknownError,
@@ -2795,6 +2799,290 @@ class RT04SemanticsTests(unittest.TestCase):
         qr_short = self._qr(100, expires=1)
         self.assertLessEqual(qr_short.interval, 15.0)
         self.assertGreater(qr_short.interval, 0)
+
+
+
+# ======================================================================
+# 4.1 / 4.2 回归测试
+# 4.1: CLI 进程从未启动 => CliSpawnError(definite=True) => DEFINITE_FAILURE
+# 4.2: UNKNOWN 型错误绝不自动 Markdown 重试；仅 definite 拒绝允许重试
+# ======================================================================
+class SpawnFailureTests(unittest.TestCase):
+    """4.1：spawn 前/中失败必须 definite，不得进入 UNKNOWN 冷却。"""
+
+    def test_ensure_failure_raises_definite_spawn_error(self):
+        tmp = Path(tempfile.mkdtemp(prefix="v2c-spawn-"))
+        cfg = _make_cfg("auto", tmp)
+        runner = CliRunner(cfg, CliBinaryManager(cfg))
+
+        async def fake_ensure():
+            raise RuntimeError("查询 npm registry 失败（HTTP 502）")
+
+        with mock.patch.object(runner.manager, "ensure", fake_ensure):
+            with self.assertRaises(CliSpawnError) as ctx:
+                asyncio.run(runner.run(["feed", "publish-feed", "--json"]))
+        self.assertTrue(ctx.exception.definite)
+
+    def test_spawn_filenotfound_raises_definite_spawn_error(self):
+        tmp = Path(tempfile.mkdtemp(prefix="v2c-spawn-"))
+        cfg = _make_cfg("auto", tmp)
+        manager = CliBinaryManager(cfg)
+        runner = CliRunner(cfg, manager)
+
+        async def fake_ensure():
+            return str(tmp / "does-not-exist")
+
+        with mock.patch.object(manager, "ensure", fake_ensure):
+            with self.assertRaises(CliSpawnError) as ctx:
+                asyncio.run(runner.run(["feed", "publish-feed", "--json"]))
+        self.assertTrue(ctx.exception.definite)
+
+    def test_spawn_permissionerror_raises_definite_spawn_error(self):
+        tmp = Path(tempfile.mkdtemp(prefix="v2c-spawn-"))
+        exe = tmp / "not_executable"
+        exe.write_text("#!/bin/sh\necho hi\n")
+        exe.chmod(0o644)
+        cfg = _make_cfg(str(exe), tmp)
+        runner = CliRunner(cfg, CliBinaryManager(cfg))
+        with self.assertRaises(CliSpawnError) as ctx:
+            asyncio.run(runner.run(["feed", "publish-feed", "--json"], ensure=False))
+        self.assertTrue(ctx.exception.definite)
+
+    def test_spawn_enoexec_raises_definite_spawn_error(self):
+        tmp = Path(tempfile.mkdtemp(prefix="v2c-spawn-"))
+        exe = tmp / "bad_binary"
+        exe.write_bytes(b"\x7fNOT-AN-EXECUTABLE")
+        exe.chmod(0o755)
+        cfg = _make_cfg(str(exe), tmp)
+        runner = CliRunner(cfg, CliBinaryManager(cfg))
+        with self.assertRaises(CliSpawnError) as ctx:
+            asyncio.run(runner.run(["feed", "publish-feed", "--json"], ensure=False))
+        self.assertTrue(ctx.exception.definite)
+
+    def test_after_spawn_output_error_is_not_definite(self):
+        """进程已正常启动、只是输出坏掉 => 必须保持 UNKNOWN（非 definite）。"""
+        tmp = Path(tempfile.mkdtemp(prefix="v2c-spawn-"))
+        exe = tmp / "garbage_cli"
+        exe.write_text("#!/usr/bin/env python3\nprint('posted ok\\n{bad')\n")
+        exe.chmod(0o755)
+        cfg = _make_cfg(str(exe), tmp)
+        runner = CliRunner(cfg, CliBinaryManager(cfg))
+        with self.assertRaises(CliOutputError) as ctx:
+            asyncio.run(
+                runner.run_json(["feed", "publish-feed", "--json"], ensure=False)
+            )
+        self.assertFalse(ctx.exception.definite)
+
+    def test_spawn_failure_no_unknown_file_and_no_debounce(self):
+        cfg = _audit_cfg(debounce_seconds=600)
+        video = _video_file(cfg, "spawn_pipe.mp4")
+        unknown_file = cfg.data_dir / "unknown_submits.json"
+
+        class U:
+            def describe_missing(self):
+                return []
+
+            async def publish_video(self, p, content=""):
+                raise CliSpawnError("tencent-channel-cli 进程启动失败：No such file")
+
+        pipe = VideoPipeline(
+            cfg,
+            _Router(_Parser(_result([VideoContent(video)])), link="https://x/spawn"),
+            U(),
+        )
+
+        async def scenario():
+            with self.assertRaises(CliSpawnError):
+                await pipe.process("https://x/spawn")
+            return (
+                unknown_file.exists(),
+                pipe._unknown,
+                pipe._debouncer.peek("https://x/spawn"),
+            )
+
+        exists, unknown, hit = asyncio.run(scenario())
+        self.assertFalse(exists, "definite 失败不得写 unknown_submits.json")
+        self.assertEqual(unknown, {})
+        self.assertFalse(hit, "definite 失败必须放开防抖")
+
+    def test_spawn_failure_allows_immediate_retry(self):
+        cfg = _audit_cfg(debounce_seconds=600)
+        calls = {"n": 0}
+
+        class U:
+            def describe_missing(self):
+                return []
+
+            async def publish_video(self, p, content=""):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise CliSpawnError("tencent-channel-cli 进程启动失败：No such file")
+                return PublishResult(raw={}, feed_id="F2", share_url=None)
+
+        parser = _Parser(
+            lambda: _result([VideoContent(_video_file(cfg, "spawn_retry.mp4"))])
+        )
+        pipe = VideoPipeline(cfg, _Router(parser, link="https://x/retry"), U())
+
+        async def scenario():
+            with self.assertRaises(CliSpawnError):
+                await pipe.process("https://x/retry")
+            return await pipe.process("https://x/retry")
+
+        second = asyncio.run(scenario())
+        self.assertIsNotNone(second, "definite 失败后同链接必须可以立即重试")
+        self.assertEqual(calls["n"], 2)
+
+
+class MarkdownRetryGuardTests(unittest.TestCase):
+    """4.2：UNKNOWN 型错误绝不自动 Markdown 重试；仅 definite 拒绝允许。"""
+
+    def _mk(self, script, link="https://x/md", debounce=600):
+        cfg = _audit_cfg(debounce_seconds=debounce)
+
+        class P:
+            platform = Platform(name="f", display_name="测试")
+
+            async def parse(self, k, s):
+                return _result(
+                    [VideoContent(_video_file(cfg, "md_pipe.mp4"))], title="# 标题"
+                )
+
+        class R:
+            def match(self, t):
+                return (P(), "k", _Match(link))
+
+        calls = {"n": 0}
+        contents = []
+
+        class Runner:
+            async def run_json(self, argv, **_kw):
+                calls["n"] += 1
+                if "--content" in argv:
+                    contents.append(argv[argv.index("--content") + 1])
+                idx = min(calls["n"], len(script)) - 1
+                item = script[idx]
+                if isinstance(item, Exception):
+                    raise item
+                return item
+
+        return cfg, VideoPipeline(cfg, R(), ChannelUploader(cfg, Runner())), calls, contents
+
+    def test_output_error_with_markdown_calls_once(self):
+        _, pipe, calls, _ = self._mk(
+            [CliOutputError("tencent-channel-cli 返回非 JSON 内容：Markdown 不支持")]
+        )
+
+        async def scenario():
+            with self.assertRaises(PublishResultUnknownError):
+                await pipe.process("https://x/md")
+
+        asyncio.run(scenario())
+        self.assertEqual(calls["n"], 1, "UNKNOWN 型错误不得触发 Markdown 重试")
+
+    def test_timeout_with_markdown_calls_once(self):
+        _, pipe, calls, _ = self._mk(
+            [CliTimeoutError("tencent-channel-cli 执行超时（>600s）markdown")]
+        )
+
+        async def scenario():
+            with self.assertRaises(CliTimeoutError):
+                await pipe.process("https://x/md")
+
+        asyncio.run(scenario())
+        self.assertEqual(calls["n"], 1)
+
+    def test_non_definite_error_with_markdown_calls_once(self):
+        _, pipe, calls, _ = self._mk(
+            [
+                CliError(
+                    "tencent-channel-cli 退出码 1：markdown 渲染失败",
+                    returncode=1,
+                    definite=False,
+                )
+            ]
+        )
+
+        async def scenario():
+            with self.assertRaises(CliError):
+                await pipe.process("https://x/md")
+
+        asyncio.run(scenario())
+        self.assertEqual(calls["n"], 1, "非 definite 错误不得触发 Markdown 重试")
+
+    def test_definite_markdown_rejection_retries_then_success(self):
+        _, pipe, calls, contents = self._mk(
+            [
+                CliError(
+                    "标题不支持 Markdown 语法",
+                    returncode=0,
+                    payload={"success": False, "message": "标题不支持 Markdown 语法"},
+                    definite=True,
+                ),
+                {
+                    "success": True,
+                    "data": {"feed_id": "F1", "share_url": "https://pd.qq.com/s/1"},
+                },
+            ]
+        )
+        result = asyncio.run(pipe.process("https://x/md"))
+        self.assertIsNotNone(result)
+        self.assertEqual(result.publish.feed_id, "F1")
+        self.assertEqual(calls["n"], 2, "definite Markdown 拒绝应允许重试一次")
+        self.assertEqual(contents, ["# 标题", "标题"], "重试必须使用清理后的标题")
+
+    def test_retry_second_unknown_stays_unknown_and_keeps_debounce(self):
+        _, pipe, calls, _ = self._mk(
+            [
+                CliError(
+                    "标题不支持 Markdown 语法",
+                    returncode=0,
+                    payload={"success": False, "message": "标题不支持 Markdown 语法"},
+                    definite=True,
+                ),
+                CliOutputError("tencent-channel-cli 返回非 JSON 内容"),
+            ]
+        )
+
+        async def scenario():
+            with self.assertRaises(PublishResultUnknownError):
+                await pipe.process("https://x/md")
+            return await pipe.process("https://x/md")
+
+        second = asyncio.run(scenario())
+        self.assertIsNone(second, "第二次结果未知时必须保留冷却，阻止立即重发")
+        self.assertEqual(calls["n"], 2, "UNKNOWN 后不得再次投稿")
+
+    def test_retry_second_business_reject_is_definite_and_releasable(self):
+        _, pipe, calls, _ = self._mk(
+            [
+                CliError(
+                    "标题不支持 Markdown 语法",
+                    returncode=0,
+                    payload={"success": False, "message": "标题不支持 Markdown 语法"},
+                    definite=True,
+                ),
+                CliError(
+                    "retCode=8011：未登录",
+                    returncode=0,
+                    payload={"data": {"retCode": 8011, "msg": "未登录"}, "success": False},
+                    definite=True,
+                ),
+                {"success": True, "data": {"feed_id": "F3", "share_url": None}},
+            ]
+        )
+
+        async def scenario():
+            with self.assertRaises(CliError) as ctx:
+                await pipe.process("https://x/md")
+            # 第二次是明确业务拒绝 => definite => 防抖被放开，第三次立即成功
+            third = await pipe.process("https://x/md")
+            return ctx.exception, third
+
+        err, third = asyncio.run(scenario())
+        self.assertTrue(err.definite, "第二次明确业务拒绝必须是 definite")
+        self.assertIsNotNone(third, "definite 失败后同链接应可立即重试")
+        self.assertEqual(calls["n"], 3)
 
 
 if __name__ == "__main__":

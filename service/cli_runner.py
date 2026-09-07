@@ -77,6 +77,24 @@ class CliTimeoutError(CliError):
     """
 
 
+class CliSpawnError(CliError):
+    """CLI 进程从未成功启动（二进制准备失败或 spawn 阶段失败）。
+
+    进程从未运行 => 请求必然没有到达腾讯频道服务端。对投稿命令而言这属于
+    DEFINITE_FAILURE（确定没有产生帖子），而不是「结果未知」：上层可以据此
+    放开防抖、允许同一链接立即重试。
+
+    与 CliTimeoutError / CliOutputError 严格区分：后两者表示 CLI 已经启动、
+    结果无法核对（UNKNOWN），绝不能据此放宽防抖。
+    """
+
+    def __init__(self, message: str, **kwargs):
+        # 语义上进程从未启动必然 = 确定失败，强制 definite=True，
+        # 不允许调用方把它构造回“结果未知”的普通 CliError。
+        kwargs["definite"] = True
+        super().__init__(message, **kwargs)
+
+
 @dataclass(slots=True)
 class RunOutput:
     """原始命令输出。"""
@@ -147,7 +165,13 @@ class CliRunner:
     ) -> RunOutput:
         """执行 CLI 命令，不因返回码非 0 抛异常（由调用方决定如何处理）。"""
         if ensure:
-            binary = await self.manager.ensure()
+            try:
+                binary = await self.manager.ensure()
+            except Exception as e:  # noqa: BLE001
+                # 二进制未就绪 => CLI 从未启动 => 确定没有产生投稿。
+                # asyncio.CancelledError 是 BaseException，不会被这里捕获，
+                # 仍按取消语义向上传播。
+                raise CliSpawnError(f"tencent-channel-cli 未能启动：{e}") from e
         else:
             binary = self.manager.resolve_existing()
             if binary is None:
@@ -157,19 +181,25 @@ class CliRunner:
         timeout = timeout or self.cfg.cli_timeout
         proc = None
 
-        if input_data:
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        else:
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+        try:
+            if input_data:
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            else:
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+        except OSError as e:
+            # spawn 阶段失败（FileNotFoundError / PermissionError / ENOEXEC 等）：
+            # 子进程没有成功运行，请求必然没到服务端 => 确定失败，可安全重试。
+            # 注意：CLI 一旦启动之后的任何错误（超时/崩溃/输出损坏）都不得走这里。
+            raise CliSpawnError(f"tencent-channel-cli 进程启动失败：{e}") from e
 
         try:
             if input_data:

@@ -90,20 +90,27 @@ class ChannelUploader:
         try:
             payload = await self.runner.run_json(argv, timeout=self.cfg.cli_timeout)
         except CliError as e:
-            # CLI 纯文本模式会拒绝 Markdown 语法：用清理后的标题重试一次
-            if content and self._looks_like_markdown_hint(str(e)):
-                cleaned = self._sanitize_plain_content(content)
-                if cleaned != content:
-                    logger.warning("[uploader] 标题含 Markdown 语法，已清理后重试")
-                    return await self.publish_video(video_path, content=cleaned)
-            # 进程已带着视频启动（spawn 成功、参数合法）后，任何“输出无法解读/
-            # 通信中断”都意味着服务端可能已经收到帖子 —— 一律收敛为结果未知，
-            # 不让上层把通信层错误误判成“确定没投稿”。
+            # 4.2：必须先做“结果未知”分类，再考虑任何自动重试。
+            # CliTimeoutError / CliOutputError / PublishResultUnknownError 都表示
+            # “无法确认服务端是否已建帖”：此时绝对禁止 Markdown 自动重试，
+            # 否则第一次可能已经发帖，第二次会变成重复投稿。
             if isinstance(e, CliTimeoutError):
                 raise
             if isinstance(e, (CliOutputError, PublishResultUnknownError)):
                 raise PublishResultUnknownError(str(e)) from e
-            # 其余 CliError（含返回码非 0 且有业务 payload）由调用方按业务拒绝处理。
+            # 只有服务端明确拒绝（definite=True）且错误确属 Markdown 拒绝，
+            # 才允许清理 Markdown 后重新投稿一次。
+            if (
+                content
+                and e.definite
+                and self._looks_like_markdown_hint(str(e))
+            ):
+                cleaned = self._sanitize_plain_content(content)
+                if cleaned != content:
+                    logger.warning("[uploader] 标题含 Markdown 语法，已清理后重试")
+                    return await self.publish_video(video_path, content=cleaned)
+            # 其余 CliError（含业务拒绝 payload）由调用方按 definite 语义处理；
+            # 重试后的第二次结果同样走上面的三态分类，不会破坏状态机。
             raise
 
         if not isinstance(payload, dict):
